@@ -1,0 +1,158 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2010-2013 Marco Almeida (marcoafalmeida@gmail.com)
+
+# This file is part of fm-mailer.
+
+# fm-mailer is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+
+# fm-mailer is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public
+# License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with fm-mailer; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
+
+import sys
+import os
+import re
+import time
+import smtplib
+from subprocess import Popen, PIPE, STDOUT
+import socket
+
+# some constants
+## binaries
+FM_BIN = "/usr/sbin/fmadm"
+SVC_BIN = "/usr/bin/svcs"
+HOST_BIN = "/usr/sbin/host"
+## cfg file settings
+FROM_ADDR = "from_address"
+FROM_NAME = "from_name"
+TO_ADDR = "to_address"
+SUBJECT = "subject"
+INCLUDE_ZONES = "include_zones"
+
+
+# print error and exit
+def die(error):
+    print("Error: " + error)
+    sys.exit(1)
+
+# check for python 2.7 or 3.2
+def pythonVersionOK():
+    py_version = sys.version_info
+    return ((py_version[0] == 2 and py_version[1] >= 6) or
+            (py_version[0] == 3 and py_version[0] >= 2))
+
+# execute a command and return the string output
+def shell_execute(cmd):
+    p = Popen(cmd, stdout=PIPE)
+    return p.communicate()[0]
+
+# host must be installed in /usr/sbin/host (default path)
+def environmentOK():
+    return (os.path.exists(HOST_BIN) and
+            os.path.exists(FM_BIN) and
+            os.path.exists(SVC_BIN))
+
+# reads /etc/fm-mailer.conf and ./fm-mailer.conf; the later has
+# priority; returns a dictionary
+def loadConfig():
+    CFG1 = "/etc/fm-mailer.conf"
+    CFG2 = os.path.join(os.path.expanduser("~"), "fm-mailer.conf")
+    # some defaults
+    cfg = {INCLUDE_ZONES:False}
+    for c in [CFG1, CFG2]:
+        try:
+            raw_data = open(c).read()
+            data = expandConfig(raw_data)
+            parseConfig(data, cfg)
+        except IOError:
+            pass
+    return cfg
+
+# expand some variables in the cfg file
+def expandConfig(data):
+    host = shell_execute("hostname").decode("ascii").strip()
+    user = shell_execute("whoami").decode("ascii").strip()
+    s1 = re.sub("\$HOST", host, data)
+    s2 = re.sub("\$USER", user, s1)
+    return s2
+
+# uses regular expressions; not very efficient, but simple; efficiency
+# is not important (the conf file contains 6 lines...)
+def parseConfig(data, cfg):
+    # remove comments
+    data = re.sub("#.*?[\n]", "\n", data)
+    if TO_ADDR not in cfg:
+        cfg[TO_ADDR] = []
+    for d in re.findall(TO_ADDR + '\s*=\s*"(.*?)"', data, re.M|re.I):
+        cfg[TO_ADDR].append(d)
+    for option in [FROM_ADDR, FROM_NAME, SUBJECT, INCLUDE_ZONES]:
+        value = re.search(option + '\s*=\s*"(.*?)"', data, re.M|re.I)
+        if value is not None:
+            cfg[option] = value.group(1)
+
+# get and return a list of MX servers to a given domain
+def getMX(email_addr):
+    try:
+        domain = email_addr.split("@")[1]
+    except IndexError:
+        return None
+    try:
+        answer = shell_execute([HOST_BIN, "-t", "mx", domain])
+        if answer:
+            lines = answer.split("\n")
+            servers = [ line.split()[-1] for line in lines if line != "" ]
+            return servers
+    except OSError:
+        return None
+
+# check for devices currently faulty
+def checkFaults(zones):
+    zones_option = ""
+    if zones:
+        zones_option = "Z"
+    faults = ""
+    # FMA faults
+    faults += shell_execute([FM_BIN, "faulty"])
+    # software (services) faults
+    cmd = "%s -%sxv" % (SVC_BIN, zones_option)
+    faults += shell_execute([SVC_BIN, "-%sxv" % zones_option])
+    return faults
+
+# mail sender
+def mailReport(from_name, from_addr, to_addr_lst, subject, msg):
+    for to_addr in to_addr_lst:
+        mail_servers = getMX(to_addr)
+        for mx in mail_servers:
+            try:
+                server = smtplib.SMTP(mx)
+                # server.set_debuglevel(9)
+                mail_text = 'Subject: %s\r\nFrom: "%s" <%s>\r\nTo: %s\r\n\r\n%s' % (subject, 
+                                                                                    from_name,
+                                                                                    from_addr, 
+                                                                                    to_addr, 
+                                                                                    msg)
+                server.sendmail(from_addr, to_addr, mail_text)
+                server.quit()
+                break
+            except:
+                pass
+
+
+if __name__ == "__main__":
+    if not pythonVersionOK():
+        die("Bad Python version")
+    if not environmentOK():
+        die("At least one of %s was not found" % ", ".join([FM_BIN, SVC_BIN, HOST_BIN]))
+    cfg = loadConfig()
+    faults = checkFaults(bool(int(cfg[INCLUDE_ZONES])))
+    if faults != "":
+        mailReport(cfg[FROM_NAME], cfg[FROM_ADDR], cfg[TO_ADDR], cfg[SUBJECT], faults)
